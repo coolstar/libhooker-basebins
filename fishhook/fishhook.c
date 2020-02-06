@@ -24,9 +24,14 @@
 #include "fishhook.h"
 
 #include <dlfcn.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/types.h>
+#include <mach/mach.h>
+#include <mach/vm_map.h>
+#include <mach/vm_region.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
@@ -76,6 +81,28 @@ static int prepend_rebindings(struct rebindings_entry **rebindings_head,
   return 0;
 }
 
+static vm_prot_t get_protection(void *sectionStart) {
+  mach_port_t task = mach_task_self();
+  vm_size_t size = 0;
+  vm_address_t address = (vm_address_t)sectionStart;
+  memory_object_name_t object;
+#if __LP64__
+  mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+  vm_region_basic_info_data_64_t info;
+  kern_return_t info_ret = vm_region_64(
+      task, &address, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_64_t)&info, &count, &object);
+#else
+  mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT;
+  vm_region_basic_info_data_t info;
+  kern_return_t info_ret = vm_region(task, &address, &size, VM_REGION_BASIC_INFO, (vm_region_info_t)&info, &count, &object);
+#endif
+  if (info_ret == KERN_SUCCESS) {
+    return info.protection;
+  } else {
+    return VM_PROT_READ;
+  }
+}
+
 static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
                                            section_t *section,
                                            intptr_t slide,
@@ -101,13 +128,13 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
           if (cur->rebindings[j].replaced != NULL &&
               indirect_symbol_bindings[i] != cur->rebindings[j].replacement) {
 #ifdef __arm64e__
-            *(cur->rebindings[j].replaced) = ptrauth_sign_unauthenticated(ptrauth_strip(indirect_symbol_bindings[i], ptrauth_key_asda), ptrauth_key_asia, 0);
+            *(cur->rebindings[j].replaced) = ptrauth_auth_and_resign(indirect_symbol_bindings[i], ptrauth_key_asia, &indirect_symbol_bindings[i], ptrauth_key_asia, 0);
 #else
             *(cur->rebindings[j].replaced) = indirect_symbol_bindings[i];
 #endif
           }
 #ifdef __arm64e__
-          indirect_symbol_bindings[i] = ptrauth_sign_unauthenticated(ptrauth_strip(cur->rebindings[j].replacement, ptrauth_key_asda), ptrauth_key_asia, &indirect_symbol_bindings[i]);
+          indirect_symbol_bindings[i] = ptrauth_auth_and_resign(cur->rebindings[j].replacement, ptrauth_key_asia, 0, ptrauth_key_asia, &indirect_symbol_bindings[i]);
 #else
           indirect_symbol_bindings[i] = cur->rebindings[j].replacement;
 #endif
@@ -171,6 +198,13 @@ static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
           strcmp(cur_seg_cmd->segname, SEG_DATA_CONST) != 0) {
         continue;
       }
+      const bool isDataConst = strcmp(cur_seg_cmd->segname, SEG_DATA_CONST) == 0;
+      vm_prot_t oldProtection = VM_PROT_READ;
+      if (isDataConst) {
+        void *const_seg = (void *)(slide + cur_seg_cmd->vmaddr);
+        oldProtection = get_protection(const_seg);
+        mprotect(const_seg, cur_seg_cmd->vmsize, PROT_READ | PROT_WRITE);
+      }
       for (uint j = 0; j < cur_seg_cmd->nsects; j++) {
         section_t *sect =
           (section_t *)(cur + sizeof(segment_command_t)) + j;
@@ -191,20 +225,14 @@ static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
             while (cur){
               for (uint j = 0; j < cur->rebindings_nel; j++) {
                 void *symbol = dlsym(library, cur->rebindings[j].name);
-                symbol = ptrauth_strip(symbol, ptrauth_key_asda);
-
-                void *stripped_binding = ptrauth_strip(indirect_symbol_bindings[i], ptrauth_key_asda);
-
-                if (symbol == stripped_binding){
+                if (symbol == indirect_symbol_bindings[i]){
                   foundSymbol = true;
 
-                  void *strippedReplacement = ptrauth_strip(cur->rebindings[j].replacement, ptrauth_key_asda);
-
-                  if (cur->rebindings[j].replaced != NULL && stripped_binding != strippedReplacement) {
-                    *(cur->rebindings[j].replaced) = ptrauth_sign_unauthenticated(stripped_binding, ptrauth_key_asia, 0);
+                  if (cur->rebindings[j].replaced != NULL && indirect_symbol_bindings[i] != cur->rebindings[j].replacement) {
+                    *(cur->rebindings[j].replaced) = indirect_symbol_bindings[i];
                   }
 
-                  indirect_symbol_bindings[i] = ptrauth_sign_unauthenticated(strippedReplacement, ptrauth_key_asia, 0);
+                  indirect_symbol_bindings[i] = cur->rebindings[j].replacement;
 
                   break;
                 }
@@ -216,6 +244,20 @@ static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
           }
         }
 #endif
+      }
+      if (isDataConst) {
+        int protection = 0;
+        if (oldProtection & VM_PROT_READ) {
+          protection |= PROT_READ;
+        }
+        if (oldProtection & VM_PROT_WRITE) {
+          protection |= PROT_WRITE;
+        }
+        if (oldProtection & VM_PROT_EXECUTE) {
+          protection |= PROT_EXEC;
+        }
+        void *const_seg = (void *)(slide + cur_seg_cmd->vmaddr);
+        mprotect(const_seg, cur_seg_cmd->vmsize, protection);
       }
     }
   }
