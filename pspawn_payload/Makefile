@@ -3,7 +3,7 @@ OUTDIR ?= bin
 
 TARGET_OS_TV ?= 0
 ifeq ($(TARGET_OS_TV), 1)
-CC      = xcrun -sdk appletvos cc -arch arm64 -arch arm64e
+CC      = xcrun -sdk appletvos cc -arch arm64
 else
 CC      = xcrun -sdk iphoneos cc -arch arm64 -arch arm64e
 endif

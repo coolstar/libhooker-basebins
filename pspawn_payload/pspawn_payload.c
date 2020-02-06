@@ -69,37 +69,35 @@ const char* xpcproxy_blacklist[] = {
     NULL
 };
 
-typedef int (*pspawn_t)(pid_t * pid, const char* path, const posix_spawn_file_actions_t *file_actions, posix_spawnattr_t *attrp, char const* argv[], const char* envp[]);
+typedef int (*pspawn_t)(pid_t * pid, const char* path, const posix_spawn_file_actions_t *file_actions, const posix_spawnattr_t *attrp, char const* argv[], const char* envp[]);
 
 pspawn_t old_pspawn, old_pspawnp;
 pspawn_t old_pspawn_broken, old_pspawnp_broken;
 
-static int fake_posix_spawn_common(pid_t * pid, const char* path, const posix_spawn_file_actions_t *file_actions, posix_spawnattr_t *attrp, char const* argv[], const char* envp[], pspawn_t old) {
+static int fake_posix_spawn_common(pid_t * pid, const char* path, const posix_spawn_file_actions_t *file_actions, const posix_spawnattr_t *attrp, char const* argv[], const char* envp[], pspawn_t old) {
     DEBUGLOG("We got called (fake_posix_spawn)! %s", path);
-    
+
     const char *inject_me = NULL;
     
-    if (current_process == PROCESS_LAUNCHD) {
-        if (strcmp(path, "/usr/libexec/xpcproxy") == 0) {
-            inject_me = PSPAWN_PAYLOAD_DYLIB;
-            
-            const char* startd = argv[1];
-            if (startd != NULL) {
-                DEBUGLOG("Starting xpcproxy service %s", startd);
-                const char **blacklist = xpcproxy_blacklist;
-            
-                while (*blacklist) {
-                    if (strncmp(startd, *blacklist, strlen(*blacklist)) == 0) {
-                        DEBUGLOG("xpcproxy for '%s' which is in blacklist, not injecting", startd);
-                        inject_me = NULL;
-                        break;
-                    }
-                    
-                    ++blacklist;
+    if (current_process == PROCESS_LAUNCHD && strcmp(path, "/usr/libexec/xpcproxy") == 0) {
+        inject_me = PSPAWN_PAYLOAD_DYLIB;
+        
+        const char* startd = argv[1];
+        if (startd != NULL) {
+            DEBUGLOG("Starting xpcproxy service %s", startd);
+            const char **blacklist = xpcproxy_blacklist;
+        
+            while (*blacklist) {
+                if (strncmp(startd, *blacklist, strlen(*blacklist)) == 0) {
+                    DEBUGLOG("xpcproxy for '%s' which is in blacklist, not injecting", startd);
+                    inject_me = NULL;
+                    break;
                 }
+                
+                ++blacklist;
             }
         }
-    } else if (current_process == PROCESS_XPCPROXY) {
+    } else {
         inject_me = SBINJECT_PAYLOAD_DYLIB;
     }
     
