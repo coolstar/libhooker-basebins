@@ -3,7 +3,7 @@ OUTDIR ?= bin
 
 .PHONY: all clean
 
-SUBPRJ = pspawn_payload jailbreakd2 libjailbreak_mig
+SUBPRJ = pspawn_payload inject_criticald3 libhooker_start
 all: $(OUTDIR)/$(TARGET)
 
 MFLAGS = OUTDIR=$(abspath $(OUTDIR))

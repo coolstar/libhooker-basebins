@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <dlfcn.h>
 #include <string.h>
+#include <stdarg.h>
 #include "fishhook.h"
 
 int file_exist(const char *filename) {
@@ -190,16 +191,63 @@ static int fake_posix_spawnp(pid_t * pid, const char* file, const posix_spawn_fi
     return fake_posix_spawn_common(pid, file, file_actions, attrp, argv, envp, old_pspawnp);
 }
 
+struct mach_exception { int length; const char *prefix; };
+#define DECL_EXCEPTION(s) { sizeof(s) - 1, s }
+static struct mach_exception mach_lookup_exception_list[] = {
+    // rbs
+    DECL_EXCEPTION("com.apple.ReportCrash.SimulateCrash"),
+    // lh
+    DECL_EXCEPTION("lh:"),
+    { 0, NULL },
+};
+#undef DECL_EXCEPTION
+
+int sandbox_check_by_audit_token(audit_token_t, const char *operation, int sandbox_filter_type, ...);
+static int (*old_sandbox_check_by_audit_token)(audit_token_t, const char *operation, int sandbox_filter_type, ...);
+static int (*old_sandbox_check_by_audit_token_broken)(audit_token_t, const char *operation, int sandbox_filter_type, ...);
+static int fake_sandbox_check_by_audit_token(audit_token_t au, const char *operation, int sandbox_filter_type, ...) {
+    int retval;
+    if (!strncmp(operation, "mach-", 5)) {
+        va_list a;
+        va_start(a, sandbox_filter_type);
+        const char *name = va_arg(a, const char *);
+        va_end(a);
+
+        if (!name) {
+            // sure, why not
+            return 0;
+        }
+
+        if (strcmp(operation + 5, "lookup") != 0)
+            goto passthru;
+
+        for (struct mach_exception *ent = mach_lookup_exception_list; ent->length != 0; ++ent) {
+            if (!strncmp((char *)name, ent->prefix, ent->length)) {
+                DEBUGLOG("MACH: Passing for %s", name);
+                return 0;
+            }
+        }
+
+      passthru:
+        retval = old_sandbox_check_by_audit_token(au, operation, sandbox_filter_type, name);
+    } else {
+        retval = old_sandbox_check_by_audit_token(au, operation, sandbox_filter_type, NULL);
+    }
+    return retval;
+}
+
 static void rebind_pspawns(void) {
     void *libsystem = dlopen("/usr/lib/libSystem.B.dylib", RTLD_NOW);
     old_pspawn = dlsym(libsystem, "posix_spawn");
     old_pspawnp = dlsym(libsystem, "posix_spawnp");
+    old_sandbox_check_by_audit_token = dlsym(libsystem, "sandbox_check_by_audit_token");
     struct rebinding rebindings[] = {
         {"posix_spawn", (void *)fake_posix_spawn, (void **)&old_pspawn_broken},
-        {"posix_spawnp", (void *)fake_posix_spawnp, (void **)&old_pspawnp_broken}
+        {"posix_spawnp", (void *)fake_posix_spawnp, (void **)&old_pspawnp_broken},
+        {"sandbox_check_by_audit_token", (void *)fake_sandbox_check_by_audit_token, (void **)&old_sandbox_check_by_audit_token_broken}
     };
     
-    rebind_symbols(rebindings, 2);
+    rebind_symbols(rebindings, 3);
 }
 
 static void* thd_func(void* arg){
