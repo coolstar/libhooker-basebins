@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include "fishhook.h"
+#include "memDebug.h"
 
 int file_exist(const char *filename) {
     struct stat buffer;
@@ -70,6 +71,163 @@ const char* xpcproxy_blacklist[] = {
     NULL
 };
 
+#define ENV_PREFIX "DYLD_INSERT_LIBRARIES="
+#define ENV_NAME "DYLD_INSERT_LIBRARIES"
+
+static const char *stringByAppendingString(const char *prefix, const char *suffix){
+    unsigned long totalLen = strlen(prefix) + strlen(suffix) + 1;
+    
+    char *newStr = userland_alloc(totalLen * sizeof(char));
+    bzero(newStr, totalLen);
+    strncpy(newStr, prefix, strlen(prefix));
+    strncpy(newStr + strlen(prefix), suffix, strlen(suffix));
+    return newStr;
+}
+
+static bool stringStartsWith(const char *string, const char *startsWith){
+    if (strlen(startsWith) > strlen(string)){
+        return false;
+    }
+    return strncmp(startsWith, string, strlen(startsWith)) == 0;
+}
+
+static const char *dylibsToInject(const char *originalEnvVar, const char *dylibToInject){
+    if (!originalEnvVar){
+        return stringByAppendingString(ENV_PREFIX, dylibToInject);
+    }
+    
+    char *envVar = (char *)userland_strdup(originalEnvVar);
+    if (strlen(envVar) <= strlen(ENV_PREFIX)) {
+        userland_free((void *)envVar);
+        return stringByAppendingString(ENV_PREFIX, dylibToInject);
+    }
+    
+    char *envContents = envVar + strlen(ENV_PREFIX);
+    
+    int estCount = 1;
+    for (int i = 0; i < strlen(envContents); i++){
+        if (envContents[i] == ':') {
+            estCount++;
+        }
+    }
+    
+    const char **entries = userland_alloc(estCount * sizeof(char *));
+    bzero(entries, estCount * sizeof(const char *));
+    
+    int totalLength = 0;
+    
+    int count = 0;
+    char *pch;
+    pch = strtok((char *)envContents, ":");
+    while (pch != NULL){
+        if (strcmp(pch, dylibToInject) != 0){
+            entries[count] = userland_strdup(pch);
+            totalLength += strlen(pch);
+            count++;
+        }
+        pch = strtok(NULL, ":");
+    }
+    
+    userland_free((void *)envVar);
+    
+    char *newStr = userland_alloc(strlen(dylibToInject) + totalLength + count + 1);
+    bzero(newStr, strlen(dylibToInject) + totalLength + count + 1);
+    
+    size_t filledSize = strlen(dylibToInject);
+    strncpy(newStr, dylibToInject, filledSize);
+    
+    for (int i = 0; i < count; i++){
+        strncpy(newStr + filledSize, ":", 1);
+        filledSize++;
+        
+        strncpy(newStr + filledSize, entries[i], strlen(entries[i]));
+        filledSize += strlen(entries[i]);
+        userland_free((void *)entries[i]);
+    }
+    userland_free(entries);
+    
+    const char *newEnvVar = stringByAppendingString(ENV_PREFIX, newStr);
+    userland_free(newStr);
+    
+    return newEnvVar;
+}
+
+static const char **copyEnvArrList(const char **env){
+    int envCount = 0;
+    if (env){
+        for (int i = 0; env[i]; i++){
+            envCount++;
+        }
+    }
+    
+    const char **newEnv = userland_alloc(sizeof(const char *) * (envCount + 1));
+    bzero(newEnv, sizeof(const char *) * (envCount + 1));
+    for (int i = 0; i < envCount; i++){
+        newEnv[i] = userland_strdup(env[i]);
+    }
+    return newEnv;
+}
+
+static const char **popEnv(const char **env, const char *envName, const char **poppedEnvPtr){
+    const char *poppedEnv = NULL;
+    int newEnvCount = 0;
+    
+    const char *envPrefix = stringByAppendingString(envName, "=");
+    for (int i = 0; env[i]; i++){
+        if (stringStartsWith(env[i], envPrefix)){
+            poppedEnv = env[i];
+        } else {
+            newEnvCount++;
+        }
+    }
+    
+    if (poppedEnvPtr){
+        *poppedEnvPtr = poppedEnv;
+    }
+    
+    const char **newEnv = userland_alloc(sizeof(const char *) * (newEnvCount + 1));
+    bzero(newEnv, sizeof(const char *) * (newEnvCount + 1));
+    int j = 0;
+    for (int i = 0; env[i]; i++){
+        if (!stringStartsWith(env[i], envPrefix)){
+            newEnv[j] = env[i];
+            j++;
+        }
+    }
+    userland_free((void *)envPrefix);
+    userland_free(env);
+    
+    return newEnv;
+}
+
+static const char **pushEnv(const char **env, const char *envVar){
+    if (!envVar){
+        return env;
+    }
+    
+    int newEnvCount = 1;
+    for (int i = 0; env[i]; i++){
+        newEnvCount++;
+    }
+    
+    const char **newEnv = userland_alloc(sizeof(const char *) * (newEnvCount + 1));
+    bzero(newEnv, sizeof(const char *) * (newEnvCount + 1));
+    for (int i = 0; env[i]; i++){
+        newEnv[i] = env[i];
+    }
+    newEnv[newEnvCount - 1] = envVar;
+    userland_free(env);
+    return newEnv;
+}
+
+static void freeEnvArrList(const char **env){
+    for (int i = 0; env[i]; i++){
+        userland_free((void *)env[i]);
+    }
+    userland_free((void *)env);
+}
+
+
 typedef int (*pspawn_t)(pid_t * pid, const char* path, const posix_spawn_file_actions_t *file_actions, const posix_spawnattr_t *attrp, char const* argv[], const char* envp[]);
 
 pspawn_t old_pspawn, old_pspawnp;
@@ -78,10 +236,10 @@ pspawn_t old_pspawn_broken, old_pspawnp_broken;
 static int fake_posix_spawn_common(pid_t * pid, const char* path, const posix_spawn_file_actions_t *file_actions, const posix_spawnattr_t *attrp, char const* argv[], const char* envp[], pspawn_t old) {
     DEBUGLOG("We got called (fake_posix_spawn)! %s", path);
 
-    const char *inject_me = NULL;
+    const char *dylibToInject = NULL;
     
     if (current_process == PROCESS_LAUNCHD && strcmp(path, "/usr/libexec/xpcproxy") == 0) {
-        inject_me = PSPAWN_PAYLOAD_DYLIB;
+        dylibToInject = PSPAWN_PAYLOAD_DYLIB;
         
         const char* startd = argv[1];
         if (startd != NULL) {
@@ -91,7 +249,7 @@ static int fake_posix_spawn_common(pid_t * pid, const char* path, const posix_sp
             while (*blacklist) {
                 if (strncmp(startd, *blacklist, strlen(*blacklist)) == 0) {
                     DEBUGLOG("xpcproxy for '%s' which is in blacklist, not injecting", startd);
-                    inject_me = NULL;
+                    dylibToInject = NULL;
                     break;
                 }
                 
@@ -99,75 +257,28 @@ static int fake_posix_spawn_common(pid_t * pid, const char* path, const posix_sp
             }
         }
     } else {
-        inject_me = SBINJECT_PAYLOAD_DYLIB;
+        dylibToInject = SBINJECT_PAYLOAD_DYLIB;
     }
     
-    // XXX log different err on inject_me == NULL and nonexistent inject_me
-    if (inject_me == NULL || !file_exist(inject_me)) {
+    // XXX log different err on dylibToInject == NULL and nonexistent dylibToInject
+    if (dylibToInject == NULL || !file_exist(dylibToInject)) {
         DEBUGLOG("Nothing to inject");
         return old(pid, path, file_actions, attrp, argv, envp);
     }
     
-    DEBUGLOG("Injecting %s into %s", inject_me, path);
+    DEBUGLOG("Injecting %s into %s", dylibToInject, path);
     
-#ifdef PSPAWN_PAYLOAD_DEBUG
-    if (argv != NULL){
-        DEBUGLOG("Args: ");
-        const char** currentarg = argv;
-        while (*currentarg != NULL){
-            DEBUGLOG("\t%s", *currentarg);
-            currentarg++;
-        }
+    
+    const char **newEnvp = copyEnvArrList(envp);
+    const char *rawDyldInsertLibraries = NULL;
+    newEnvp = popEnv(newEnvp, ENV_NAME, &rawDyldInsertLibraries);
+    
+    const char *newDyldInsertLibraries = dylibsToInject(rawDyldInsertLibraries, dylibToInject);
+    if (rawDyldInsertLibraries){
+        userland_free((void *)rawDyldInsertLibraries);
     }
-#endif
-    
-    int envcount = 0;
-    int allenvs = 0;
-    
-    if (envp != NULL){
-        DEBUGLOG("Env: ");
-        const char** currentenv = envp;
-        while (*currentenv != NULL){
-            DEBUGLOG("\t%s", *currentenv);
-            if (strstr(*currentenv, "DYLD_INSERT_LIBRARIES") == NULL) {
-                envcount++;
-            }
-            allenvs++;
-            currentenv++;
-        }
-    }
-    
-    char const** newenvp = malloc((envcount+2) * sizeof(char **));
-    int j = 0;
-    for (int i = 0; i < allenvs; i++){
-        if (strstr(envp[i], "DYLD_INSERT_LIBRARIES") != NULL){
-            continue;
-        }
-        newenvp[j] = envp[i];
-        j++;
-    }
-    
-    char *envp_inject = malloc(strlen("DYLD_INSERT_LIBRARIES=") + strlen(inject_me) + 1);
-    
-    envp_inject[0] = '\0';
-    strcat(envp_inject, "DYLD_INSERT_LIBRARIES=");
-    strcat(envp_inject, inject_me);
-    
-    newenvp[j] = envp_inject;
-    newenvp[j+1] = NULL;
-    
-#if PSPAWN_PAYLOAD_DEBUG
-    DEBUGLOG("New Env:");
-    const char** currentenv = newenvp;
-    while (*currentenv != NULL){
-        DEBUGLOG("\t%s", *currentenv);
-        currentenv++;
-    }
-#endif
-    
-    int origret;
-    
-#define FLAG_ATTRIBUTE_XPCPROXY (1 << 17)
+    rawDyldInsertLibraries = newDyldInsertLibraries;
+    newEnvp = pushEnv(newEnvp, rawDyldInsertLibraries);
     
     if (current_process == PROCESS_XPCPROXY) {
         // dont leak logging fd into execd process
@@ -178,7 +289,8 @@ static int fake_posix_spawn_common(pid_t * pid, const char* path, const posix_sp
         }
 #endif
     }
-    origret = old(pid, path, file_actions, attrp, argv, newenvp);
+    int origret = old(pid, path, file_actions, attrp, argv, newEnvp);
+    freeEnvArrList(newEnvp);
     
     return origret;
 }
