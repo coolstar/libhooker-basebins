@@ -12,9 +12,6 @@
 #include "fishhook.h"
 #include "memDebug.h"
 
-#define PROC_PIDPATHINFO_MAXSIZE  (1024)
-int proc_pidpath(pid_t pid, void *buffer, uint32_t buffersize);
-
 int file_exist(const char *filename) {
     struct stat buffer;
     int r = stat(filename, &buffer);
@@ -26,15 +23,11 @@ int file_exist(const char *filename) {
 // XXX multiple xpcproxies opening same file
 // XXX not closing logfile before spawn
 #define XPCPROXY_LOG_PATH "/pspawn_payload_xpcproxy.log"
-#define MMAINTENANCED_LOG_PATH "/pspawn_payload_mmaintenanced.log"
 FILE *log_file;
 #define DEBUGLOG(fmt, args...)\
 do {\
 if (log_file == NULL) {\
 char *logpath = (current_process == PROCESS_LAUNCHD) ? LAUNCHD_LOG_PATH : XPCPROXY_LOG_PATH;\
-if (current_process == PROCESS_MMAINTENANCED){\
-logpath = MMAINTENANCED_LOG_PATH;\
-}\
 log_file = fopen(logpath, "a"); \
 if (log_file == NULL) break; \
 } \
@@ -56,8 +49,7 @@ fflush(log_file); \
 // it's safe to assume that we're in xpcproxy if getpid() != 1
 enum currentprocess {
     PROCESS_LAUNCHD,
-    PROCESS_XPCPROXY,
-    PROCESS_MMAINTENANCED
+    PROCESS_XPCPROXY
 };
 
 int current_process = PROCESS_XPCPROXY;
@@ -265,12 +257,7 @@ static int fake_posix_spawn_common(pid_t * pid, const char* path, const posix_sp
             }
         }
     } else {
-        if (strcmp(path, "/usr/libexec/mmaintenanced") == 0){
-            DEBUGLOG("Starting mmaintenanced -- special handling");
-            dylibToInject = PSPAWN_PAYLOAD_DYLIB;
-        } else {
-            dylibToInject = SBINJECT_PAYLOAD_DYLIB;
-        }
+        dylibToInject = SBINJECT_PAYLOAD_DYLIB;
     }
     
     // XXX log different err on dylibToInject == NULL and nonexistent dylibToInject
@@ -380,21 +367,6 @@ static void* thd_func(void* arg){
     return NULL;
 }
 
-extern int reboot3(int howto);
-static int (*old_reboot3)(int howto);
-
-static int fake_reboot3(int howto) {
-    DEBUGLOG("Don't you dare! Btw howto is: 0x%x\n", howto);
-    DEBUGLOG("Going to run ldrestart since we should...\n");
-    
-    pid_t pd;
-    
-    const char* args_ldrestart[] = {"ldrestart", NULL};
-    posix_spawn(&pd, "/usr/bin/ldrestart", NULL, NULL, (char **)&args_ldrestart, NULL);
-    waitpid(pd, NULL, 0);
-    exit(0);
-}
-
 __attribute__ ((constructor))
 static void ctor(void) {
     if (getpid() == 1) {
@@ -403,21 +375,7 @@ static void ctor(void) {
         pthread_t thd;
         pthread_create(&thd, NULL, thd_func, NULL);
     } else {
-        char pathbuf[PROC_PIDPATHINFO_MAXSIZE];
-        bzero(pathbuf, sizeof(pathbuf));
-        
-        int ret = proc_pidpath(getpid(), pathbuf, sizeof(pathbuf));
-        if (ret > 0 && (strcmp(pathbuf, "/usr/libexec/mmaintenanced") == 0)){
-            current_process = PROCESS_MMAINTENANCED;
-            
-            struct rebinding rebindings[] = {
-                {"reboot3", (void *)fake_reboot3, (void **)&old_reboot3},
-            };
-            rebind_symbols(rebindings, 1);
-        } else {
-            current_process = PROCESS_XPCPROXY;
-        
-            rebind_pspawns();
-        }
+        current_process = PROCESS_XPCPROXY;
+        rebind_pspawns();
     }
 }
