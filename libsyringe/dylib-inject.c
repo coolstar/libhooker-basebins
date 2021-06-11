@@ -15,6 +15,9 @@
 #include <unistd.h>
 #include <ptrauth.h>
 #include <assert.h>
+#include <mach-o/dyld_images.h>
+
+extern int __shared_region_check_np(uint64_t *startAddress);
 
 #pragma pack(4)
 typedef struct {
@@ -40,8 +43,6 @@ typedef struct {
     natural_t new_state[614];
 } exception_raise_state_reply;
 #pragma pack()
-
-#define INJECT_CRITICALD_DEBUG 1
 
 #ifdef INJECT_CRITICALD_DEBUG
 #define CHK_KR(kr, msg) \
@@ -122,11 +123,53 @@ kern_return_t LHRunFunc(mach_port_t remoteThread,
     return kr;
 }
 
+void LHSetPtrReg(uint64_t *reg, uint64_t val, arm_thread_state64_t state){
+#if __DARWIN_OPAQUE_ARM_THREAD_STATE64
+    if (state.__opaque_flags & __DARWIN_ARM_THREAD_STATE64_FLAGS_NO_PTRAUTH){
+        *reg = (uint64_t)ptrauth_strip((void *)val, ptrauth_key_asia);
+    } else {
+        *reg = val;
+    }
+#else
+    *reg = val;
+#endif
+}
+
+void *LHReslideFunc(void *addr, int64_t slideDiff){
+    uintptr_t addrRaw = (uintptr_t)ptrauth_strip(addr, ptrauth_key_asia);
+    addrRaw -= slideDiff;
+    return ptrauth_sign_unauthenticated((void *)addrRaw, ptrauth_key_asia, 0);
+}
+
 kern_return_t LHGetRemoteMachThread(mach_port_t target,
                               kern_return_t (^threadCall)(mach_port_t remoteThread,
-                                                 mach_port_t exceptionHandler))
+                                                 mach_port_t exceptionHandler,
+                                                 int64_t slideDiff))
 {
     kern_return_t kr = KERN_SUCCESS;
+
+    int64_t slideDiff = 0;
+    uint64_t ourSlide = 0;
+
+    kr = __shared_region_check_np(&ourSlide);
+    CHK_KR(kr, "__shared_region_check_np");
+    
+    struct task_dyld_info dyld_info;
+    mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+    kr = task_info(target, TASK_DYLD_INFO, (task_info_t)&dyld_info, &count);
+    CHK_KR(kr, "task_info");
+    
+    struct dyld_all_image_infos *infos = malloc(dyld_info.all_image_info_size);
+    mach_vm_size_t outSz;
+    kr = mach_vm_read_overwrite(target, dyld_info.all_image_info_addr, dyld_info.all_image_info_size, (mach_vm_address_t)infos, &outSz);
+    CHK_KR(kr, "mach_vm_read dyld_all_image_infos");
+
+    uint64_t dyldBase = infos->sharedCacheBaseAddress - infos->sharedCacheSlide;
+    ourSlide -= dyldBase;
+    slideDiff = ourSlide - infos->sharedCacheSlide;
+
+    free(infos);
+
     #define STACK_SIZE (mach_vm_size_t)0x4000
         
     mach_vm_address_t remoteStack;
@@ -173,7 +216,8 @@ kern_return_t LHGetRemoteMachThread(mach_port_t target,
     CHK_KR(kr, "thread_set_exception_ports exceptionHandler");
     
     arm_thread_state64_t state = {};
-    bzero(&state, sizeof(arm_thread_state64_t));
+    mach_msg_type_number_t stateCnt = ARM_THREAD_STATE64_COUNT;
+    thread_get_state(remoteThread, ARM_THREAD_STATE64, (thread_state_t)&state, &stateCnt);
     
     mach_vm_address_t remoteMutex;
     kr = mach_vm_allocate(target, &remoteMutex, sizeof(pthread_mutex_t), VM_FLAGS_ANYWHERE);
@@ -186,11 +230,11 @@ kern_return_t LHGetRemoteMachThread(mach_port_t target,
     //Start Mem Leak
     for (int i = 0; i < 2; i++){
         //lock mutex twice
-        bzero(&state, sizeof(arm_thread_state64_t));
         state.__x[0] = (uint64_t)remotePThreadsPtr;
-        state.__x[2] = (uint64_t)dlsym(RTLD_NEXT, "pthread_mutex_lock");
+        state.__x[1] = 0;
+        LHSetPtrReg(&state.__x[2], (uint64_t)LHReslideFunc(dlsym(RTLD_NEXT, "pthread_mutex_lock"), slideDiff), state);
         state.__x[3] = (uint64_t)remoteMutex;
-        __darwin_arm_thread_state64_set_pc_fptr(state, dlsym(RTLD_NEXT, "pthread_create_from_mach_thread"));
+        __darwin_arm_thread_state64_set_pc_fptr(state, LHReslideFunc(dlsym(RTLD_NEXT, "pthread_create_from_mach_thread"), slideDiff));
         __darwin_arm_thread_state64_set_sp(state, (void *)(remoteStack + stackPointer*sizeof(uint64_t)));
         kr = LHRunFunc(remoteThread, state, head, exceptionHandler);
         CHK_KR(kr, "runFunc pthread_mutex_lock");
@@ -281,17 +325,22 @@ kern_return_t LHGetRemoteMachThread(mach_port_t target,
     CHK_KR(kr, "thread_get_state remotePThread threadState");
     
     void *correctLr = __darwin_arm_thread_state64_get_lr_fptr(threadState);
+    if (correctLr == NULL){
+        correctLr = (void *)__darwin_arm_thread_state64_get_lr(threadState);
+        correctLr = ptrauth_sign_unauthenticated(correctLr, ptrauth_key_asia, 0);
+    }
     __darwin_arm_thread_state64_set_lr_fptr(threadState, ptrauth_sign_unauthenticated((void *)0x1717171, ptrauth_key_asia, 0)); //set lr
     
     kr = thread_set_state(remotePThread, ARM_THREAD_STATE64, (thread_state_t)&threadState, ARM_THREAD_STATE64_COUNT);
     CHK_KR(kr, "thread_set_state remotePThread state");
     
     //setup third call (unlock mutex)
-    bzero(&state, sizeof(arm_thread_state64_t));
+    memcpy(&state, &threadState, sizeof(arm_thread_state64_t));
     state.__x[0] = (uint64_t)remotePThreadsPtr;
-    state.__x[2] = (uint64_t)dlsym(RTLD_NEXT, "pthread_mutex_unlock");
+    state.__x[1] = 0;
+    LHSetPtrReg(&state.__x[2], (uint64_t)LHReslideFunc(dlsym(RTLD_NEXT, "pthread_mutex_unlock"), slideDiff), state);
     state.__x[3] = (uint64_t)remoteMutex;
-    __darwin_arm_thread_state64_set_pc_fptr(state, dlsym(RTLD_NEXT, "pthread_create_from_mach_thread"));
+    __darwin_arm_thread_state64_set_pc_fptr(state, LHReslideFunc(dlsym(RTLD_NEXT, "pthread_create_from_mach_thread"), slideDiff));
     __darwin_arm_thread_state64_set_sp(state, (void *)(remoteStack + stackPointer*sizeof(uint64_t)));
     remotePThreadsPtr += sizeof(pthread_t);
     
@@ -299,11 +348,12 @@ kern_return_t LHGetRemoteMachThread(mach_port_t target,
     CHK_KR(kr, "runFunc pthread_mutex_unlock");
     
     //setup fourth call (destroy mutex)
-    bzero(&state, sizeof(arm_thread_state64_t));
+    memcpy(&state, &threadState, sizeof(arm_thread_state64_t));
     state.__x[0] = (uint64_t)remotePThreadsPtr;
-    state.__x[2] = (uint64_t)dlsym(RTLD_NEXT, "pthread_mutex_destroy");
+    state.__x[1] = 0;
+    LHSetPtrReg(&state.__x[2], (uint64_t)LHReslideFunc(dlsym(RTLD_NEXT, "pthread_mutex_destroy"), slideDiff), state);
     state.__x[3] = (uint64_t)remoteMutex;
-    __darwin_arm_thread_state64_set_pc_fptr(state, dlsym(RTLD_NEXT, "pthread_create_from_mach_thread"));
+    __darwin_arm_thread_state64_set_pc_fptr(state, LHReslideFunc(dlsym(RTLD_NEXT, "pthread_create_from_mach_thread"), slideDiff));
     __darwin_arm_thread_state64_set_sp(state, (void *)(remoteStack + stackPointer*sizeof(uint64_t)));
     remotePThreadsPtr += sizeof(pthread_t);
     
@@ -355,7 +405,7 @@ kern_return_t LHGetRemoteMachThread(mach_port_t target,
         memcpy(&state, &threadState, sizeof(arm_thread_state64_t));
         state.__x[0] = remotePThreadStruct;
         state.__x[1] = 0;
-        __darwin_arm_thread_state64_set_pc_fptr(state, dlsym(RTLD_NEXT, "pthread_detach"));
+        __darwin_arm_thread_state64_set_pc_fptr(state, LHReslideFunc(dlsym(RTLD_NEXT, "pthread_detach"), slideDiff));
         
         kr = LHRunFunc(remotePThread, state, head2, exceptionHandler2);
         CHK_KR(kr, "runFunc pthread_detach");
@@ -371,7 +421,7 @@ kern_return_t LHGetRemoteMachThread(mach_port_t target,
     kr = thread_set_state(remotePThread, ARM_THREAD_STATE64, (thread_state_t)&threadState, ARM_THREAD_STATE64_COUNT);
     CHK_KR(kr, "thread_set_state");
     
-    kr = threadCall(remotePThread, exceptionHandler2);
+    kr = threadCall(remotePThread, exceptionHandler2, slideDiff);
     CHK_KR(kr, "threadCall");
     
     __darwin_arm_thread_state64_set_lr_fptr(threadState, (void *)correctLr);
@@ -409,6 +459,7 @@ kern_return_t LHGetRemoteMachThread(mach_port_t target,
 kern_return_t LHdlsymRemote(mach_port_t target,
                           mach_port_t remoteThread,
                           mach_port_t exceptionHandler,
+                          int64_t slideDiff,
                           char *dylib,
                           char *symbol,
                           kern_return_t (^resultCall)(uint64_t funcAddr))
@@ -432,7 +483,7 @@ kern_return_t LHdlsymRemote(mach_port_t target,
     state.__x[0] = 0x100 + remoteStr;
     state.__x[1] = RTLD_NOW;
     state.__x[2] = 0;
-    __darwin_arm_thread_state64_set_pc_fptr(state, dlsym(RTLD_NEXT, "dlopen"));
+    __darwin_arm_thread_state64_set_pc_fptr(state, LHReslideFunc(dlsym(RTLD_NEXT, "dlopen"), slideDiff));
     
     kr = LHRunFunc(remoteThread, state, head, exceptionHandler);
     CHK_KR(kr, "dlopen");
@@ -449,7 +500,7 @@ kern_return_t LHdlsymRemote(mach_port_t target,
         state.__x[0] = dlAddr;
         state.__x[1] = 0x100 + remoteStr;
         state.__x[2] = 0;
-        __darwin_arm_thread_state64_set_pc_fptr(state, dlsym(RTLD_NEXT, "dlsym"));
+        __darwin_arm_thread_state64_set_pc_fptr(state, LHReslideFunc(dlsym(RTLD_NEXT, "dlsym"), slideDiff));
         
         kr = LHRunFunc(remoteThread, state, head, exceptionHandler);
         CHK_KR(kr, "dlsym");
@@ -472,9 +523,9 @@ kern_return_t LHdlsymRemote(mach_port_t target,
 }
 
 kern_return_t LHInjectDylib(mach_port_t target, char *dylib, int argc, char *argv[]){
-    return LHGetRemoteMachThread(target, ^kern_return_t (mach_port_t remoteThread,  mach_port_t exceptionHandler){
-        return LHdlsymRemote(target, remoteThread, exceptionHandler, "/usr/lib/libhooker.dylib", "LHWrapFunction", ^kern_return_t(uint64_t wrapFunction) {
-            return LHdlsymRemote(target, remoteThread, exceptionHandler, dylib, "MSmain0", ^kern_return_t(uint64_t funcAddr) {
+    return LHGetRemoteMachThread(target, ^kern_return_t (mach_port_t remoteThread, mach_port_t exceptionHandler, int64_t slideDiff){
+        return LHdlsymRemote(target, remoteThread, exceptionHandler, slideDiff, "/usr/lib/libhooker.dylib", "LHWrapFunction", ^kern_return_t(uint64_t wrapFunction) {
+            return LHdlsymRemote(target, remoteThread, exceptionHandler, slideDiff, dylib, "MSmain0", ^kern_return_t(uint64_t funcAddr) {
                 kern_return_t kr = KERN_SUCCESS;
                 mach_vm_address_t remoteArr;
                 kr = mach_vm_allocate(target, &remoteArr, 0x100 + (sizeof(mach_vm_address_t) * argc), VM_FLAGS_ANYWHERE);
@@ -511,7 +562,9 @@ kern_return_t LHInjectDylib(mach_port_t target, char *dylib, int argc, char *arg
                 state.__x[1] = 0x100 + remoteArr;
                 state.__x[2] = funcAddr;
                 state.__x[3] = 0;
-                __darwin_arm_thread_state64_set_pc_fptr(state, (void *)wrapFunction);
+
+                void *rawFunction = ptrauth_strip((void *)wrapFunction, ptrauth_key_asia);
+                __darwin_arm_thread_state64_set_pc_fptr(state, ptrauth_sign_unauthenticated(rawFunction, ptrauth_key_asia, 0));
                 
                 kr = LHRunFunc(remoteThread, state, head, exceptionHandler);
                 CHK_KR(kr, "MSMain0");

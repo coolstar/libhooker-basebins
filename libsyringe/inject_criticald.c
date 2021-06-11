@@ -27,6 +27,7 @@ int main(int argc, char* argv[]){
 
 	if (ret != 0){
         printf("[libhooker] Something happened!\n");
+        return ret;
 	}
 	return 0;
 }
