@@ -5,7 +5,7 @@ TARGET_OS_TV ?= 0
 ifeq ($(TARGET_OS_TV), 1)
 CC      = xcrun -sdk appletvos clang -arch $(ARCH)
 else
-CC      = xcrun -sdk iphoneos clang -arch arm64 -arch arm64e
+CC      = xcrun -sdk iphoneos clang -arch arm64
 endif
 
 # it is injected into trust cache by code

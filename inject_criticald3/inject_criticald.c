@@ -16,7 +16,7 @@ int main(int argc, char* argv[]){
 	task_t remoteTask;
 	kern_return_t kr = task_for_pid(mach_task_self(), pid, &remoteTask);
 	if (kr != KERN_SUCCESS) {
-		printf("Failed to get task for pid %u!\n", pid);
+		fprintf(stderr, "Failed to get task for pid %u!\n", pid);
 		return -1;
 	}
 
@@ -25,9 +25,9 @@ int main(int argc, char* argv[]){
     kern_return_t ret = inject_dylib(remoteTask, dylib);
 
 	if (ret == 0){
-		printf("No error occurred!\n");
+		fprintf(stderr, "No error occurred!\n");
 	} else {
-        printf("Something happened!\n");
+        fprintf(stderr, "Something happened!\n");
 	}
 	return 0;
 }
