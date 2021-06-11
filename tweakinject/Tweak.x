@@ -188,20 +188,26 @@ static NSString *LHTemporaryDirectory(){
 static void SigHandler(int signo, siginfo_t *info, void *uap){
     if (isSpringBoard || isBackboard){
         FILE *f = fopen("/var/mobile/Library/.sbinjectSafeMode", "w");
-        fprintf(f, "Hello World\n");
-        fclose(f);
+        if (f){
+            fprintf(f, "Hello World\n");
+            fclose(f);
+        }
     }
     if (processHash){
         FILE *f = fopen([[NSString stringWithFormat:@"%@/.safeMode-%@", LHTemporaryDirectory(), processHash] UTF8String], "w");
-        fprintf(f, "Hello World!\n");
-        fclose(f);
+        if (f){
+            fprintf(f, "Hello World!\n");
+            fclose(f);
+        }
     }
 
     if (isSpringBoard && killBackBoarddWithSpringBoard){
         mkdir("/var/tmp/com.apple.backboardd/", 0700);
         FILE *f = fopen("/var/tmp/com.apple.backboardd/.bbSafeMode", "w");
-        fprintf(f, "Hello World!\n");
-        fclose(f);
+        if (f){
+            fprintf(f, "Hello World!\n");
+            fclose(f);
+        }
 
         kill(backboarddPID, SIGKILL);
     }
