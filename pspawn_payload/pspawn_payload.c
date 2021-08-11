@@ -256,6 +256,8 @@ static int fake_posix_spawn_common(pid_t * pid, const char* path, const posix_sp
                 ++blacklist;
             }
         }
+    } else if (current_process == PROCESS_LAUNCHD && strcmp(path, "/sbin/launchd") == 0){
+        dylibToInject = PSPAWN_PAYLOAD_DYLIB;
     } else {
         dylibToInject = SBINJECT_PAYLOAD_DYLIB;
     }
